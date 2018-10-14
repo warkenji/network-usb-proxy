@@ -1,4 +1,5 @@
 import socket
+import sys
 import time
 import os
 import select
@@ -34,21 +35,18 @@ class Server:
         self.thread_stopped = []
         self.thread_started = []
 
-    def start(self, internal_process=True):
-        try:
-            if internal_process:
-                os.system("rm -f {}{}*".format(Server.current_dir, os.path.sep))
-                self.process_recv_broadcast()
-            else:
-                self.process_send_broadcast()
-        except KeyboardInterrupt:
+    @staticmethod
+    def load_headers(raw_data, str_headers=""):
+        content_separation = "\r\n\r\n"
+        data = raw_data.decode()
 
-            for thread in self.thread_started + self.thread_stopped:
-                thread.join()
+        str_headers += data
+        loaded = str_headers.find(content_separation) == -1 and len(raw_data) > 0
 
-            print("Fin de Service")
+        return loaded, str_headers
 
-    def create_headers(self, code=200, message='OK'):
+    @staticmethod
+    def create_headers(code=200, message='OK'):
         weekdayname = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
         monthname = [None,
@@ -68,6 +66,17 @@ class Server:
 
         return Headers(str_headers)
 
+    def start(self, internal_process=True):
+        try:
+            if internal_process:
+                self.process_recv_broadcast()
+            else:
+                self.process_send_broadcast()
+        except KeyboardInterrupt:
+
+            for thread in self.thread_started + self.thread_stopped:
+                thread.join()
+
     def process_send_broadcast(self):
         observer = Observer()
         event_handler = FileCreationHandler(self.process_send, '{}_'.format(Server.send_prefix))
@@ -83,6 +92,9 @@ class Server:
         max_users = 32
         server_socket = socket.socket()
         server_socket.bind((self.address, self.port))
+
+        if not sys.platform.startswith("cygwin"):
+            os.system("rm -f {}{}*".format(Server.current_dir, os.path.sep))
 
         while True:
             server_socket.listen(max_users)
@@ -114,9 +126,7 @@ class Server:
             else:
                 client_socket.send(headers.headers_encoded)
 
-            r_socket = socket.socket(fileno=fd_send)
-
-            conns = [r_socket, client_socket]
+            conns = [fd_send, client_socket]
             close_connection = False
 
             print(conns)
@@ -157,9 +167,7 @@ class Server:
 
         if headers is not None:
             try:
-                r_socket = socket.socket(fileno=fd_recv)
-
-                conns = [client_socket, r_socket]
+                conns = [client_socket, fd_recv]
                 close_connection = False
 
                 while not close_connection:
@@ -262,8 +270,8 @@ class Server:
 
         if len(str_headers) > 0 is not None:
             headers = Headers(str_headers)
-
             filename = str(uuid3(uuid1(), "{}{}".format(headers.request_line, client_socket)))
+
             prefix = '{}_'.format(Server.send_prefix)
             path = "{}{}{}{}".format(Server.current_dir, os.path.sep, prefix, filename)
             os.mkfifo(path)
@@ -288,13 +296,3 @@ class Server:
         client_socket.send(headers.request_line.encode() + b"\r\n\r\n")
 
         return None, None, None, None
-
-    @staticmethod
-    def load_headers(raw_data, str_headers=""):
-        content_separation = "\r\n\r\n"
-        data = raw_data.decode()
-
-        str_headers += data
-        check = str_headers.find(content_separation) == -1 and len(raw_data) > 0
-
-        return check, str_headers
