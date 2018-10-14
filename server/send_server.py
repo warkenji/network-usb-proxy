@@ -1,4 +1,4 @@
-from .proxy.server import Server
+from proxy.server import Server
 
 
 if __name__ == '__main__':
