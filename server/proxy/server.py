@@ -69,6 +69,7 @@ class Server:
     def start(self, internal_process=True):
         try:
             os.mkfifo(self.fifo_path)
+            os.system("chmod 0666 {}".format(self.fifo_path))
         except OSError as e:
             print("{}{}{}".format(BColors.FAIL, e, BColors.ENDC))
 
@@ -287,18 +288,23 @@ class Server:
 
             os.write(self.fd_fifo, filename.encode() + b"\0")
 
-            prefix = '{}_'.format(Server.send_prefix)
-            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, prefix, filename)
-            os.mkfifo(path)
+            send_prefix = '{}_'.format(Server.send_prefix)
+            recv_prefix = '{}_'.format(Server.recv_prefix)
 
+            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, send_prefix, filename)
+            os.mkfifo(path)
+            os.system("chmod 0666 {}".format(path))
+
+            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, recv_prefix, filename)
+            os.mkfifo(path)
+            os.system("chmod 0666 {}".format(path))
+
+            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, send_prefix, filename)
             fd_send = os.open(path, os.O_WRONLY)
 
             os.write(fd_send, headers.headers_encoded)
 
-            prefix = '{}_'.format(Server.recv_prefix)
-            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, prefix, filename)
-            os.mkfifo(path)
-
+            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, recv_prefix, filename)
             fd_recv = os.open(path, os.O_RDONLY)
 
             print(headers.request_line)
