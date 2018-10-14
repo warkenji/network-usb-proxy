@@ -3,14 +3,11 @@ import sys
 import time
 import os
 import select
-from ntpath import basename
 
 from .bcolors import BColors
-from .filesystem import FileCreationHandler
 from .request import Headers
 from threading import Thread, current_thread
 from uuid import uuid1, uuid3
-from watchdog.observers import Observer
 
 
 class Server:
@@ -20,6 +17,8 @@ class Server:
     thread_started = None
     port = None
     timeout = 5
+    fd_fifo = None
+    fifo_path = None
     daemon_threads = True
     recv_prefix = "recv"
     send_prefix = "send"
@@ -34,6 +33,7 @@ class Server:
         self.buffer_size = buffer_size
         self.thread_stopped = []
         self.thread_started = []
+        self.fifo_path = "{}{}{}".format(Server.current_dir, os.path.sep, "mkfifo")
 
     @staticmethod
     def load_headers(raw_data, str_headers=""):
@@ -68,6 +68,11 @@ class Server:
 
     def start(self, internal_process=True):
         try:
+            os.mkfifo(self.fifo_path)
+        except OSError as e:
+            print("{}{}{}".format(BColors.FAIL, e, BColors.ENDC))
+
+        try:
             if internal_process:
                 self.process_recv_broadcast()
             else:
@@ -78,15 +83,25 @@ class Server:
                 thread.join()
 
     def process_send_broadcast(self):
-        observer = Observer()
-        event_handler = FileCreationHandler(self.process_send, '{}_'.format(Server.send_prefix))
+        fd = os.open(self.fifo_path, os.O_RDONLY)
+        filenames = b""
 
-        observer.schedule(event_handler, Server.current_dir, recursive=False)
-        observer.start()
+        while True:
+            filenames += os.read(fd, self.buffer_size)
+            pos = filenames.find(b'\0')
 
-        self.thread_started.append(observer)
+            while pos != -1:
+                filename = filenames[:pos].decode()
+                filenames = filenames[pos + 1:]
+                pos = filenames.find(b'\0')
+                thread = Thread(target=self.process_send, args=(filename,), daemon=Server.daemon_threads)
+                thread.start()
+                self.thread_started.append(thread)
 
-        observer.join()
+                for thread_stopped in self.thread_stopped:
+                    thread_stopped.join()
+
+                self.thread_stopped.clear()
 
     def process_recv_broadcast(self):
         max_users = 32
@@ -94,7 +109,9 @@ class Server:
         server_socket.bind((self.address, self.port))
 
         if not sys.platform.startswith("cygwin"):
-            os.system("rm -f {}{}*".format(Server.current_dir, os.path.sep))
+            os.system("rm -f {}{}*_*".format(Server.current_dir, os.path.sep))
+
+        self.fd_fifo = os.open(self.fifo_path, os.O_WRONLY | os.O_SYNC)
 
         while True:
             server_socket.listen(max_users)
@@ -108,12 +125,10 @@ class Server:
 
             self.thread_stopped.clear()
 
-    def process_send(self, path):
+    def process_send(self, filename):
         Server.id += 1
         process_id = Server.id
         print("Process n°{}: started".format(process_id))
-
-        filename = basename(path).replace('{}_'.format(Server.send_prefix), '')
 
         headers, client_socket, fd_send, fd_recv = self.headers_send(filename)
 
@@ -128,8 +143,6 @@ class Server:
 
             conns = [fd_send, client_socket]
             close_connection = False
-
-            print(conns)
 
             while not close_connection:
                 rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
@@ -271,6 +284,8 @@ class Server:
         if len(str_headers) > 0 is not None:
             headers = Headers(str_headers)
             filename = str(uuid3(uuid1(), "{}{}".format(headers.request_line, client_socket)))
+
+            os.write(self.fd_fifo, filename.encode() + b"\0")
 
             prefix = '{}_'.format(Server.send_prefix)
             path = "{}{}{}{}".format(Server.current_dir, os.path.sep, prefix, filename)
