@@ -114,8 +114,12 @@ class Server:
             else:
                 client_socket.send(headers.headers_encoded)
 
-            conns = [fd_send, client_socket]
+            r_socket = socket.socket(fileno=fd_send)
+
+            conns = [r_socket, client_socket]
             close_connection = False
+
+            print(conns)
 
             while not close_connection:
                 rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
@@ -153,7 +157,9 @@ class Server:
 
         if headers is not None:
             try:
-                conns = [client_socket, fd_recv]
+                r_socket = socket.socket(fileno=fd_recv)
+
+                conns = [client_socket, r_socket]
                 close_connection = False
 
                 while not close_connection:
