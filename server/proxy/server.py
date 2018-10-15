@@ -147,20 +147,22 @@ class Server:
 
             while not close_connection:
                 rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
-                if xlist or not rlist:
-                    break
-                for r in rlist:
-                    w = conns[1] if r is conns[0] else conns[0]
 
-                    if r == conns[0]:
-                        data = os.read(fd_send, self.buffer_size)
-                        w.sendall(data)
-                    else:
-                        data = r.recv(self.buffer_size)
-                        os.write(fd_recv, data)
+                if len(xlist) > 0 or len(rlist) == 0:
+                    close_connection = True
+                else:
+                    for r in rlist:
+                        w = conns[1] if r is conns[0] else conns[0]
 
-                    if not data:
-                        close_connection = True
+                        if r == conns[0]:
+                            data = os.read(fd_send, self.buffer_size)
+                            w.sendall(data)
+                        else:
+                            data = r.recv(self.buffer_size)
+                            os.write(fd_recv, data)
+
+                        if not data:
+                            close_connection = True
 
             os.close(fd_send)
             os.close(fd_recv)
@@ -186,20 +188,22 @@ class Server:
 
                 while not close_connection:
                     rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
-                    if xlist or not rlist:
-                        break
-                    for r in rlist:
-                        w = conns[1] if r is conns[0] else conns[0]
+                    if len(xlist) > 0 or len(rlist) == 0:
+                        close_connection = True
+                    else:
+                        for r in rlist:
+                            w = conns[1] if r is conns[0] else conns[0]
 
-                        if r == conns[0]:
-                            data = r.recv(self.buffer_size)
-                            os.write(fd_send, data)
-                        else:
-                            data = os.read(fd_recv, self.buffer_size)
-                            w.sendall(data)
+                            if r == conns[0]:
+                                data = r.recv(self.buffer_size)
+                                os.write(fd_send, data)
+                            else:
+                                data = os.read(fd_recv, self.buffer_size)
+                                w.sendall(data)
 
-                        if not data:
-                            close_connection = True
+                            if not data:
+                                close_connection = True
+
             except BrokenPipeError:
                 headers = self.create_headers(404, 'Not Found')
                 print("{}{}{}".format(BColors.FAIL, headers, BColors.ENDC))
