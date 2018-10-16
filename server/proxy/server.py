@@ -13,8 +13,8 @@ from uuid import uuid1, uuid3
 class Server:
     id = 0
     address = None
-    thread_stopped = None
-    thread_started = None
+    threads_stopped = None
+    threads_started = None
     port = None
     timeout = None
     server_serial = None
@@ -28,8 +28,8 @@ class Server:
 
     def __init__(self, serial_port):
         self.server_serial = serial.Serial(serial_port)
-        self.thread_stopped = []
-        self.thread_started = []
+        self.threads_stopped = []
+        self.threads_started = []
         self.pipes = {}
         self.read_lock = Lock()
         self.write_lock = Lock()
@@ -71,7 +71,7 @@ class Server:
         except KeyboardInterrupt:
             self.server_serial.close()
 
-            for thread in self.thread_started + self.thread_stopped:
+            for thread in self.threads_started + self.threads_stopped:
                 thread.join()
 
     def start_recv(self, address='', port=8081):
@@ -83,7 +83,7 @@ class Server:
         except KeyboardInterrupt:
             self.server_serial.close()
 
-            for thread in self.thread_started + self.thread_stopped:
+            for thread in self.threads_started + self.threads_stopped:
                 thread.join()
 
     def serial_read(self):
@@ -121,24 +121,25 @@ class Server:
 
                     thread = Thread(target=self.process_send, args=(name,), daemon=Server.daemon_threads)
                     thread.start()
-                    self.thread_started.append(thread)
+                    self.threads_started.append(thread)
 
                 if name in self.pipes:
-                    if pipe_type == "send":
+                    self.pipe_write(self.pipes[name]["w"], data)
+                    """if pipe_type == "send":
                         thread = Thread(target=self.pipe_write, args=(self.pipes[name]["w"], data), daemon=Server.daemon_threads)
                         thread.start()
-                        self.thread_started.append(thread)
+                        self.threads_started.append(thread)
 
                     else:
-                        os.write(self.pipes[name]["w"], data)
+                        os.write(self.pipes[name]["w"], data)"""
 
             except OSError as e:
                 print(e)
 
-            for thread_stopped in self.thread_stopped:
+            for thread_stopped in self.threads_stopped:
                 thread_stopped.join()
 
-            self.thread_stopped.clear()
+            self.threads_stopped.clear()
 
     def process_send_broadcast(self):
         self.process_broadcast("send")
@@ -151,19 +152,19 @@ class Server:
         thread = Thread(target=self.process_broadcast, args=("recv",), daemon=Server.daemon_threads)
         thread.start()
 
-        self.thread_started.append(thread)
+        self.threads_started.append(thread)
 
         while True:
             server_socket.listen(max_users)
             (client_socket, client_address) = server_socket.accept()
             thread = Thread(target=self.process_recv, args=(client_socket,), daemon=Server.daemon_threads)
             thread.start()
-            self.thread_started.append(thread)
+            self.threads_started.append(thread)
 
-            for thread_stopped in self.thread_stopped:
+            for thread_stopped in self.threads_stopped:
                 thread_stopped.join()
 
-            self.thread_stopped.clear()
+            self.threads_stopped.clear()
 
     def process_send(self, name):
         Server.id += 1
@@ -277,7 +278,7 @@ class Server:
 
         Server.id -= 1
         print("Process n°{}: stopped".format(process_id))
-        self.thread_stopped.append(current_thread())
+        self.threads_stopped.append(current_thread())
 
     def headers_send(self, name):
         str_headers = ""
