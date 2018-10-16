@@ -16,14 +16,11 @@ class Server:
     thread_stopped = None
     thread_started = None
     port = None
-    timeout = 30
+    timeout = None
     server_serial = None
     read_lock = None
     write_lock = None
     daemon_threads = True
-    recv_prefix = "recv"
-    send_prefix = "send"
-    current_dir = 'tmp'
     buffer_size = 8192
     protocol = "HTTP/1.1"
     server_version = "BaseHTTP/0.1"
@@ -109,6 +106,9 @@ class Server:
 
         self.write_lock.release()
 
+    def pipe_write(self, fd_w, data):
+        os.write(fd_w, data)
+
     def process_broadcast(self, pipe_type):
 
         while True:
@@ -123,15 +123,22 @@ class Server:
                     thread.start()
                     self.thread_started.append(thread)
 
-                    for thread_stopped in self.thread_stopped:
-                        thread_stopped.join()
-
-                    self.thread_stopped.clear()
-
                 if name in self.pipes:
-                    os.write(self.pipes[name]["w"], data)
+                    if pipe_type == "send":
+                        thread = Thread(target=self.pipe_write, args=(self.pipes[name]["w"], data), daemon=Server.daemon_threads)
+                        thread.start()
+                        self.thread_started.append(thread)
+
+                    else:
+                        os.write(self.pipes[name]["w"], data)
+
             except OSError as e:
                 print(e)
+
+            for thread_stopped in self.thread_stopped:
+                thread_stopped.join()
+
+            self.thread_stopped.clear()
 
     def process_send_broadcast(self):
         self.process_broadcast("send")
@@ -191,9 +198,13 @@ class Server:
                 else:
                     for r in rlist:
                         if r == fd_r:
+                            print("send:", headers.request_line)
+
                             data = os.read(fd_r, Server.buffer_size)
                             client_socket.sendall(data)
                         else:
+                            print("receive:", headers.request_line)
+
                             data = r.recv(Server.buffer_size)
                             self.serial_write(name, data)
 
@@ -225,7 +236,6 @@ class Server:
 
         if headers is not None:
             print(headers.request_line)
-            str_headers_response = b""
 
             try:
                 self.serial_write(name, headers.headers_encoded)
@@ -240,10 +250,14 @@ class Server:
                     else:
                         for r in rlist:
                             if r == client_socket:
+                                print("send:", headers.request_line)
+
                                 data = r.recv(Server.buffer_size)
                                 self.serial_write(name, data)
 
                             else:
+                                print("receive:", headers.request_line)
+
                                 data = os.read(fd_r, Server.buffer_size)
                                 client_socket.sendall(data)
 
