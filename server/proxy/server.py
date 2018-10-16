@@ -16,7 +16,7 @@ class Server:
     thread_stopped = None
     thread_started = None
     port = None
-    timeout = 5
+    timeout = 30
     server_serial = None
     read_lock = None
     write_lock = None
@@ -91,7 +91,7 @@ class Server:
 
     def serial_read(self):
         self.read_lock.acquire()
-        name = self.server_serial.read_until()[:-1].decode()
+        name = self.server_serial.read(36).decode()
         size = int(self.server_serial.read_until()[:-1])
 
         data = self.server_serial.read(size)
@@ -102,7 +102,7 @@ class Server:
 
     def serial_write(self, name, data):
         self.write_lock.acquire()
-        self.server_serial.write(name.encode() + b"\n")
+        self.server_serial.write(name.encode())
         self.server_serial.write(str(len(data)).encode() + b"\n")
 
         self.server_serial.write(data)
@@ -303,7 +303,7 @@ class Server:
 
                 self.serial_write(name, headers.request_line.encode() + b"\r\n\r\n")
 
-                return None, None, None, None
+                return None, None
 
             return headers, client_socket
 
@@ -317,7 +317,7 @@ class Server:
 
         self.serial_write(name, headers.request_line.encode() + b"\r\n\r\n")
 
-        return None, None, None, None
+        return None, None
 
     def headers_recv(self, client_socket):
         str_headers = ""
@@ -341,4 +341,4 @@ class Server:
 
         client_socket.send(headers.request_line.encode() + b"\r\n\r\n")
 
-        return None, None, None, None
+        return None, None
