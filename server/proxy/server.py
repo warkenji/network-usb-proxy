@@ -1,12 +1,12 @@
 import socket
-import sys
+import serial
 import time
 import os
 import select
 
 from .bcolors import BColors
 from .request import Headers
-from threading import Thread, current_thread
+from threading import Thread, current_thread, Lock
 from uuid import uuid1, uuid3
 
 
@@ -17,23 +17,25 @@ class Server:
     thread_started = None
     port = None
     timeout = 5
-    fd_fifo = None
-    fifo_path = None
+    server_serial = None
+    read_lock = None
+    write_lock = None
     daemon_threads = True
     recv_prefix = "recv"
     send_prefix = "send"
     current_dir = 'tmp'
-    buffer_size = None
+    buffer_size = 8192
     protocol = "HTTP/1.1"
     server_version = "BaseHTTP/0.1"
+    pipes = None
 
-    def __init__(self, address='', port=8081, buffer_size=8192):
-        self.address = address
-        self.port = port
-        self.buffer_size = buffer_size
+    def __init__(self, serial_port):
+        self.server_serial = serial.Serial(serial_port)
         self.thread_stopped = []
         self.thread_started = []
-        self.fifo_path = "{}{}{}".format(Server.current_dir, os.path.sep, "mkfifo")
+        self.pipes = {}
+        self.read_lock = Lock()
+        self.write_lock = Lock()
 
     @staticmethod
     def load_headers(raw_data, str_headers=""):
@@ -66,53 +68,83 @@ class Server:
 
         return Headers(str_headers)
 
-    def start(self, internal_process=True):
+    def start_send(self):
         try:
-            os.mkfifo(self.fifo_path)
-            os.system("chmod 0666 {}".format(self.fifo_path))
-        except OSError as e:
-            print("{}{}{}".format(BColors.FAIL, e, BColors.ENDC))
-
-        try:
-            if internal_process:
-                self.process_recv_broadcast()
-            else:
-                self.process_send_broadcast()
+            self.process_send_broadcast()
         except KeyboardInterrupt:
+            self.server_serial.close()
 
             for thread in self.thread_started + self.thread_stopped:
                 thread.join()
 
-    def process_send_broadcast(self):
-        fd = os.open(self.fifo_path, os.O_RDONLY)
-        filenames = b""
+    def start_recv(self, address='', port=8081):
+        self.address = address
+        self.port = port
+    
+        try:
+            self.process_recv_broadcast()
+        except KeyboardInterrupt:
+            self.server_serial.close()
+
+            for thread in self.thread_started + self.thread_stopped:
+                thread.join()
+
+    def serial_read(self):
+        self.read_lock.acquire()
+        name = self.server_serial.read_until()[:-1].decode()
+        size = int(self.server_serial.read_until()[:-1])
+
+        data = self.server_serial.read(size)
+
+        self.read_lock.release()
+
+        return name, data
+
+    def serial_write(self, name, data):
+        self.write_lock.acquire()
+        self.server_serial.write(name.encode() + b"\n")
+        self.server_serial.write(str(len(data)).encode() + b"\n")
+
+        self.server_serial.write(data)
+
+        self.write_lock.release()
+
+    def process_broadcast(self, pipe_type):
 
         while True:
-            filenames += os.read(fd, self.buffer_size)
-            pos = filenames.find(b'\0')
+            try:
+                name, data = self.serial_read()
+                if name not in self.pipes and pipe_type == "send":
+                    r, w = os.pipe()
 
-            while pos != -1:
-                filename = filenames[:pos].decode()
-                filenames = filenames[pos + 1:]
-                pos = filenames.find(b'\0')
-                thread = Thread(target=self.process_send, args=(filename,), daemon=Server.daemon_threads)
-                thread.start()
-                self.thread_started.append(thread)
+                    self.pipes[name] = {"r": r, "w": w}
 
-                for thread_stopped in self.thread_stopped:
-                    thread_stopped.join()
+                    thread = Thread(target=self.process_send, args=(name,), daemon=Server.daemon_threads)
+                    thread.start()
+                    self.thread_started.append(thread)
 
-                self.thread_stopped.clear()
+                    for thread_stopped in self.thread_stopped:
+                        thread_stopped.join()
+
+                    self.thread_stopped.clear()
+
+                if name in self.pipes:
+                    os.write(self.pipes[name]["w"], data)
+            except OSError as e:
+                print(e)
+
+    def process_send_broadcast(self):
+        self.process_broadcast("send")
 
     def process_recv_broadcast(self):
         max_users = 32
         server_socket = socket.socket()
         server_socket.bind((self.address, self.port))
 
-        if not sys.platform.startswith("cygwin"):
-            os.system("rm -f {}{}*_*".format(Server.current_dir, os.path.sep))
+        thread = Thread(target=self.process_broadcast, args=("recv",), daemon=Server.daemon_threads)
+        thread.start()
 
-        self.fd_fifo = os.open(self.fifo_path, os.O_WRONLY | os.O_SYNC)
+        self.thread_started.append(thread)
 
         while True:
             server_socket.listen(max_users)
@@ -126,50 +158,60 @@ class Server:
 
             self.thread_stopped.clear()
 
-    def process_send(self, filename):
+    def process_send(self, name):
         Server.id += 1
         process_id = Server.id
         print("Process n°{}: started".format(process_id))
 
-        headers, client_socket, fd_send, fd_recv = self.headers_send(filename)
+        headers, client_socket = self.headers_send(name)
 
         if headers is not None:
+
+            print(headers.request_line)
+
+            str_headers_response = b""
+
             if headers.request_line.startswith("CONNECT"):
                 headers = self.create_headers(message="Connection Established")
-
-                os.write(fd_recv, headers.headers_encoded)
+                self.serial_write(name, headers.headers_encoded)
+                str_headers_response = headers.headers_encoded
 
             else:
                 client_socket.send(headers.headers_encoded)
 
-            conns = [fd_send, client_socket]
+            fd_r = self.pipes[name]["r"]
+            conns = [fd_r, client_socket]
             close_connection = False
 
             while not close_connection:
                 rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
 
-                if len(xlist) > 0 or len(rlist) == 0:
+                if xlist or not rlist:
                     close_connection = True
                 else:
                     for r in rlist:
-                        w = conns[1] if r is conns[0] else conns[0]
-
-                        if r == conns[0]:
-                            data = os.read(fd_send, self.buffer_size)
-                            w.sendall(data)
+                        if r == fd_r:
+                            data = os.read(fd_r, Server.buffer_size)
+                            client_socket.sendall(data)
                         else:
-                            data = r.recv(self.buffer_size)
-                            os.write(fd_recv, data)
+                            data = r.recv(Server.buffer_size)
+                            self.serial_write(name, data)
+
+                            if str_headers_response.find(b"\r\n\r\n") == -1:
+                                str_headers_response += data
 
                         if not data:
                             close_connection = True
 
-            os.close(fd_send)
-            os.close(fd_recv)
+            headers_response = Headers(str_headers_response[:str_headers_response.find(b"\r\n\r\n") + 4].decode())
+            print(headers_response.request_line)
+
             client_socket.close()
 
-        path = "{}{}{}{}".format(Server.current_dir, os.path.sep, '{}_'.format(Server.send_prefix), filename)
-        os.unlink(path)
+        pipe = self.pipes[name]
+        del(self.pipes[name])
+        os.close(pipe["r"])
+        os.close(pipe["w"])
 
         Server.id -= 1
         print("Process n°{}: stopped".format(process_id))
@@ -179,61 +221,57 @@ class Server:
         process_id = Server.id
         print("Process n°{}: started".format(process_id))
 
-        headers, filename, fd_send, fd_recv = self.headers_recv(client_socket)
+        headers, name = self.headers_recv(client_socket)
 
         if headers is not None:
+            print(headers.request_line)
+            str_headers_response = b""
+
             try:
-                conns = [client_socket, fd_recv]
+                self.serial_write(name, headers.headers_encoded)
+                fd_r = self.pipes[name]["r"]
+                conns = [client_socket, fd_r]
                 close_connection = False
 
                 while not close_connection:
                     rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
-                    if len(xlist) > 0 or len(rlist) == 0:
+                    if xlist or not rlist:
                         close_connection = True
                     else:
                         for r in rlist:
-                            w = conns[1] if r is conns[0] else conns[0]
+                            if r == client_socket:
+                                data = r.recv(Server.buffer_size)
+                                self.serial_write(name, data)
 
-                            if r == conns[0]:
-                                data = r.recv(self.buffer_size)
-                                os.write(fd_send, data)
                             else:
-                                data = os.read(fd_recv, self.buffer_size)
-                                w.sendall(data)
+                                data = os.read(fd_r, Server.buffer_size)
+                                client_socket.sendall(data)
 
                             if not data:
                                 close_connection = True
 
-            except BrokenPipeError:
+            except OSError:
                 headers = self.create_headers(404, 'Not Found')
-                print("{}{}{}".format(BColors.FAIL, headers, BColors.ENDC))
-
-            os.close(fd_send)
-            os.close(fd_recv)
+                print("{}{}{}".format(BColors.FAIL, headers.request_line, BColors.ENDC))
 
         client_socket.close()
 
-        path = "{}{}{}{}".format(Server.current_dir, os.path.sep, '{}_'.format(Server.recv_prefix), filename)
-        os.unlink(path)
+        pipe = self.pipes[name]
+        del (self.pipes[name])
+        os.close(pipe["r"])
+        os.close(pipe["w"])
 
         Server.id -= 1
         print("Process n°{}: stopped".format(process_id))
         self.thread_stopped.append(current_thread())
 
-    def headers_send(self, filename):
+    def headers_send(self, name):
         str_headers = ""
         check = True
-        prefix = '{}_'.format(Server.send_prefix)
-        path = "{}{}{}{}".format(Server.current_dir, os.path.sep, prefix, filename)
-        fd_send = os.open(path, os.O_RDONLY)
 
         while check:
-            raw_data = os.read(fd_send, 1)
+            raw_data = os.read(self.pipes[name]["r"], 1)
             check, str_headers = Server.load_headers(raw_data, str_headers)
-
-        prefix = '{}_'.format(Server.recv_prefix)
-        path = "{}{}{}{}".format(Server.current_dir, os.path.sep, prefix, filename)
-        fd_recv = os.open(path, os.O_WRONLY)
 
         if len(str_headers) > 0 is not None:
             headers = Headers(str_headers)
@@ -253,28 +291,31 @@ class Server:
             except (socket.gaierror, OSError):
                 if headers is not None and headers.request_line.startswith('CONNECT'):
                     headers = self.create_headers(502, 'Bad Gateway')
-                    os.write(fd_recv, headers.headers_encoded)
                 else:
                     headers = self.create_headers(404, 'Not Found')
 
                 print("{}{}{}".format(BColors.FAIL, headers.request_line, BColors.ENDC))
 
-                os.write(fd_recv, headers.request_line.encode() + b"\r\n\r\n")
-                os.close(fd_send)
-                os.close(fd_recv)
+                pipe = self.pipes[name]
+                del (self.pipes[name])
+                os.close(pipe["r"])
+                os.close(pipe["w"])
+
+                self.serial_write(name, headers.request_line.encode() + b"\r\n\r\n")
 
                 return None, None, None, None
 
-            print(headers.request_line)
-
-            return headers, client_socket, fd_send, fd_recv
+            return headers, client_socket
 
         headers = self.create_headers(404, 'Not Found')
         print("{}{}{}".format(BColors.FAIL, headers.request_line, BColors.ENDC))
 
-        os.write(fd_recv, headers.request_line.encode() + b"\r\n\r\n")
-        os.close(fd_send)
-        os.close(fd_recv)
+        pipe = self.pipes[name]
+        del (self.pipes[name])
+        os.close(pipe["r"])
+        os.close(pipe["w"])
+
+        self.serial_write(name, headers.request_line.encode() + b"\r\n\r\n")
 
         return None, None, None, None
 
@@ -288,32 +329,12 @@ class Server:
 
         if len(str_headers) > 0 is not None:
             headers = Headers(str_headers)
-            filename = str(uuid3(uuid1(), "{}{}".format(headers.request_line, client_socket)))
+            name = str(uuid3(uuid1(), "{}{}".format(headers.request_line, client_socket)))
 
-            os.write(self.fd_fifo, filename.encode() + b"\0")
+            r, w = os.pipe()
+            self.pipes[name] = {'r': r, 'w': w}
 
-            send_prefix = '{}_'.format(Server.send_prefix)
-            recv_prefix = '{}_'.format(Server.recv_prefix)
-
-            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, send_prefix, filename)
-            os.mkfifo(path)
-            os.system("chmod 0666 {}".format(path))
-
-            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, recv_prefix, filename)
-            os.mkfifo(path)
-            os.system("chmod 0666 {}".format(path))
-
-            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, send_prefix, filename)
-            fd_send = os.open(path, os.O_WRONLY)
-
-            os.write(fd_send, headers.headers_encoded)
-
-            path = "{}{}{}{}".format(Server.current_dir, os.path.sep, recv_prefix, filename)
-            fd_recv = os.open(path, os.O_RDONLY)
-
-            print(headers.request_line)
-
-            return headers, filename, fd_send, fd_recv
+            return headers, name
 
         headers = self.create_headers(404, 'Not Found')
         print("{}{}{}".format(BColors.FAIL, headers.request_line, BColors.ENDC))
