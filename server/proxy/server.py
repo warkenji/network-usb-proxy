@@ -25,9 +25,10 @@ class Server:
     protocol = "HTTP/1.1"
     server_version = "BaseHTTP/0.1"
     pipes = None
+    pipe_type = None
 
     def __init__(self, serial_port):
-        self.server_serial = serial.Serial(serial_port)
+        self.server_serial = serial.Serial(serial_port, 9600)
         self.threads_stopped = []
         self.threads_started = []
         self.pipes = {}
@@ -66,6 +67,8 @@ class Server:
         return Headers(str_headers)
 
     def start_send(self):
+        self.pipe_type = "send"
+
         try:
             self.process_send_broadcast()
         except KeyboardInterrupt:
@@ -75,6 +78,7 @@ class Server:
                 thread.join()
 
     def start_recv(self, address='', port=8081):
+        self.pipe_type = "recv"
         self.address = address
         self.port = port
     
@@ -106,15 +110,12 @@ class Server:
 
         self.write_lock.release()
 
-    def pipe_write(self, fd_w, data):
-        os.write(fd_w, data)
-
-    def process_broadcast(self, pipe_type):
+    def process_broadcast(self):
 
         while True:
             try:
                 name, data = self.serial_read()
-                if name not in self.pipes and pipe_type == "send":
+                if name not in self.pipes and self.pipe_type == "send":
                     r, w = os.pipe()
 
                     self.pipes[name] = {"r": r, "w": w}
@@ -124,14 +125,7 @@ class Server:
                     self.threads_started.append(thread)
 
                 if name in self.pipes:
-                    self.pipe_write(self.pipes[name]["w"], data)
-                    """if pipe_type == "send":
-                        thread = Thread(target=self.pipe_write, args=(self.pipes[name]["w"], data), daemon=Server.daemon_threads)
-                        thread.start()
-                        self.threads_started.append(thread)
-
-                    else:
-                        os.write(self.pipes[name]["w"], data)"""
+                    os.write(self.pipes[name]["w"], data)
 
             except OSError as e:
                 print(e)
@@ -142,14 +136,14 @@ class Server:
             self.threads_stopped.clear()
 
     def process_send_broadcast(self):
-        self.process_broadcast("send")
+        self.process_broadcast()
 
     def process_recv_broadcast(self):
         max_users = 32
         server_socket = socket.socket()
         server_socket.bind((self.address, self.port))
 
-        thread = Thread(target=self.process_broadcast, args=("recv",), daemon=Server.daemon_threads)
+        thread = Thread(target=self.process_broadcast, daemon=Server.daemon_threads)
         thread.start()
 
         self.threads_started.append(thread)
@@ -199,13 +193,9 @@ class Server:
                 else:
                     for r in rlist:
                         if r == fd_r:
-                            print("send:", headers.request_line)
-
                             data = os.read(fd_r, Server.buffer_size)
                             client_socket.sendall(data)
                         else:
-                            print("receive:", headers.request_line)
-
                             data = r.recv(Server.buffer_size)
                             self.serial_write(name, data)
 
@@ -227,6 +217,7 @@ class Server:
 
         Server.id -= 1
         print("Process n°{}: stopped".format(process_id))
+        self.threads_stopped.append(current_thread())
 
     def process_recv(self, client_socket):
         Server.id += 1
@@ -251,14 +242,10 @@ class Server:
                     else:
                         for r in rlist:
                             if r == client_socket:
-                                print("send:", headers.request_line)
-
                                 data = r.recv(Server.buffer_size)
                                 self.serial_write(name, data)
 
                             else:
-                                print("receive:", headers.request_line)
-
                                 data = os.read(fd_r, Server.buffer_size)
                                 client_socket.sendall(data)
 
