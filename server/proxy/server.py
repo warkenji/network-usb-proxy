@@ -142,6 +142,7 @@ class Server:
         max_users = 32
         server_socket = socket.socket()
         server_socket.bind((self.address, self.port))
+        server_socket.listen(max_users)
 
         thread = Thread(target=self.process_broadcast, daemon=Server.daemon_threads)
         thread.start()
@@ -149,7 +150,6 @@ class Server:
         self.threads_started.append(thread)
 
         while True:
-            server_socket.listen(max_users)
             (client_socket, client_address) = server_socket.accept()
             thread = Thread(target=self.process_recv, args=(client_socket,), daemon=Server.daemon_threads)
             thread.start()
@@ -169,7 +169,7 @@ class Server:
 
         if headers is not None:
 
-            print(headers.request_line)
+            print("Process n°{}:".format(process_id), headers.request_line)
 
             str_headers_response = b""
 
@@ -206,7 +206,7 @@ class Server:
                             close_connection = True
 
             headers_response = Headers(str_headers_response[:str_headers_response.find(b"\r\n\r\n") + 4].decode())
-            print(headers_response.request_line)
+            print("Process n°{}:".format(process_id), headers_response.request_line)
 
             client_socket.close()
 
@@ -227,7 +227,7 @@ class Server:
         headers, name = self.headers_recv(client_socket)
 
         if headers is not None:
-            print(headers.request_line)
+            print("Process n°{}:".format(process_id), headers.request_line)
 
             try:
                 self.serial_write(name, headers.headers_encoded)
