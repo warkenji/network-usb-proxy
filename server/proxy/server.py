@@ -35,37 +35,6 @@ class Server:
         self.read_lock = Lock()
         self.write_lock = Lock()
 
-    @staticmethod
-    def load_headers(raw_data, str_headers=""):
-        content_separation = "\r\n\r\n"
-        data = raw_data.decode()
-
-        str_headers += data
-        loaded = str_headers.find(content_separation) == -1 and len(raw_data) > 0
-
-        return loaded, str_headers
-
-    @staticmethod
-    def create_headers(code=200, message='OK'):
-        weekdayname = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-
-        monthname = [None,
-                     'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
-        timestamp = time.time()
-
-        year, month, day, hh, mm, ss, wd, y, z = time.gmtime(timestamp)
-        timestamp_server = "{}, {:02d} {:3s} {:4d} {:02d}:{:02d}:{:02d} GMT".format(
-            weekdayname[wd],
-            day, monthname[month], year,
-            hh, mm, ss)
-
-        str_headers = "{} {} {}\r\nServer: {}\r\nDate: {}\r\n\r\n".format(Server.protocol, code, message,
-                                                                          Server.server_version, timestamp_server)
-
-        return Headers(str_headers)
-
     def start_send(self):
         self.pipe_type = "send"
 
@@ -81,7 +50,7 @@ class Server:
         self.pipe_type = "recv"
         self.address = address
         self.port = port
-    
+
         try:
             self.process_recv_broadcast()
         except KeyboardInterrupt:
@@ -111,29 +80,43 @@ class Server:
         self.write_lock.release()
 
     def process_broadcast(self):
+        try:
+            while True:
+                try:
+                    name, data = self.serial_read()
+                    if name not in self.pipes and self.pipe_type == "send" and len(data) > 0:
+                        r, w = os.pipe()
 
-        while True:
-            try:
-                name, data = self.serial_read()
-                if name not in self.pipes and self.pipe_type == "send":
-                    r, w = os.pipe()
+                        self.pipes[name] = {"r": r, "w": w}
 
-                    self.pipes[name] = {"r": r, "w": w}
+                        thread = Thread(target=self.process_send, args=(name,), daemon=Server.daemon_threads)
+                        thread.start()
+                        self.threads_started.append(thread)
 
-                    thread = Thread(target=self.process_send, args=(name,), daemon=Server.daemon_threads)
-                    thread.start()
-                    self.threads_started.append(thread)
+                    print(name, len(data))
+                    if name in self.pipes:
+                        pipe = self.pipes[name]
+                        if len(data) > 0:
+                            os.write(pipe["w"], data)
+                        else:
+                            try:
+                                del (self.pipes[name])
+                                os.close(pipe['r'])
+                                os.close(pipe['w'])
+                                print("closed")
+                            except KeyError:
+                                pass
 
-                if name in self.pipes:
-                    os.write(self.pipes[name]["w"], data)
+                except OSError as e:
+                    print(e)
 
-            except OSError as e:
-                print(e)
+                for thread_stopped in self.threads_stopped:
+                    thread_stopped.join()
 
-            for thread_stopped in self.threads_stopped:
-                thread_stopped.join()
+                self.threads_stopped.clear()
 
-            self.threads_stopped.clear()
+        except KeyboardInterrupt:
+            pass
 
     def process_send_broadcast(self):
         self.process_broadcast()
@@ -141,6 +124,7 @@ class Server:
     def process_recv_broadcast(self):
         max_users = 32
         server_socket = socket.socket()
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((self.address, self.port))
         server_socket.listen(max_users)
 
@@ -161,186 +145,228 @@ class Server:
             self.threads_stopped.clear()
 
     def process_send(self, name):
-        Server.id += 1
-        process_id = Server.id
-        print("Process n°{}: started".format(process_id))
+        try:
+            Server.id += 1
+            process_id = Server.id
+            print("Process n°{}: started".format(process_id))
 
-        headers, client_socket = self.headers_send(name)
+            pipe = self.pipes[name]
+            fd_r = pipe["r"]
+            fd_w = pipe["w"]
+            result = self.req_2(fd_r, name)
 
-        if headers is not None:
+            if result:
+                command_code, s, address = result
+                if command_code == b'\x01':
+                    conns = [fd_r, s]
+                    close_connection = False
 
-            print("Process n°{}:".format(process_id), headers.request_line)
+                    while not close_connection:
+                        rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
 
-            str_headers_response = b""
-
-            if headers.request_line.startswith("CONNECT"):
-                headers = self.create_headers(message="Connection Established")
-                self.serial_write(name, headers.headers_encoded)
-                str_headers_response = headers.headers_encoded
-
-            else:
-                client_socket.send(headers.headers_encoded)
-
-            fd_r = self.pipes[name]["r"]
-            conns = [fd_r, client_socket]
-            close_connection = False
-
-            while not close_connection:
-                rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
-
-                if xlist or not rlist:
-                    close_connection = True
-                else:
-                    for r in rlist:
-                        if r == fd_r:
-                            data = os.read(fd_r, Server.buffer_size)
-                            client_socket.sendall(data)
-                        else:
-                            data = r.recv(Server.buffer_size)
-                            self.serial_write(name, data)
-
-                            if str_headers_response.find(b"\r\n\r\n") == -1:
-                                str_headers_response += data
-
-                        if not data:
+                        if xlist or not rlist:
+                            print("test fin 1 1")
                             close_connection = True
+                        else:
+                            print("test continue")
+                            for r in rlist:
+                                if r == fd_r:
+                                    data = os.read(fd_r, Server.buffer_size)
+                                    s.sendall(data)
+                                else:
+                                    data = r.recv(Server.buffer_size)
+                                    self.serial_write(name, data)
 
-            headers_response = Headers(str_headers_response[:str_headers_response.find(b"\r\n\r\n") + 4].decode())
-            print("Process n°{}:".format(process_id), headers_response.request_line)
+                                if not data:
+                                    print("test fin 1 2")
+                                    close_connection = True
 
-            client_socket.close()
+                elif command_code == b'\x02':
+                    pass
 
-        pipe = self.pipes[name]
-        del(self.pipes[name])
-        os.close(pipe["r"])
-        os.close(pipe["w"])
+                elif command_code == b'\x03':
+                    conns = [fd_r]
+                    close_connection = False
 
-        Server.id -= 1
-        print("Process n°{}: stopped".format(process_id))
-        self.threads_stopped.append(current_thread())
+                    while not close_connection:
+                        rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
 
-    def process_recv(self, client_socket):
-        Server.id += 1
-        process_id = Server.id
-        print("Process n°{}: started".format(process_id))
-
-        headers, name = self.headers_recv(client_socket)
-
-        if headers is not None:
-            print("Process n°{}:".format(process_id), headers.request_line)
-
-            try:
-                self.serial_write(name, headers.headers_encoded)
-                fd_r = self.pipes[name]["r"]
-                conns = [client_socket, fd_r]
-                close_connection = False
-
-                while not close_connection:
-                    rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
-                    if xlist or not rlist:
-                        close_connection = True
-                    else:
-                        for r in rlist:
-                            if r == client_socket:
-                                data = r.recv(Server.buffer_size)
-                                self.serial_write(name, data)
-
-                            else:
-                                data = os.read(fd_r, Server.buffer_size)
-                                client_socket.sendall(data)
+                        if xlist or not rlist:
+                            close_connection = True
+                        else:
+                            data = os.read(fd_r, Server.buffer_size)
+                            s.sendto(data, address)
 
                             if not data:
                                 close_connection = True
 
-            except OSError:
-                headers = self.create_headers(404, 'Not Found')
-                print("{}{}{}".format(BColors.FAIL, headers.request_line, BColors.ENDC))
-
-        client_socket.close()
-
-        pipe = self.pipes[name]
-        del (self.pipes[name])
-        os.close(pipe["r"])
-        os.close(pipe["w"])
-
-        Server.id -= 1
-        print("Process n°{}: stopped".format(process_id))
-        self.threads_stopped.append(current_thread())
-
-    def headers_send(self, name):
-        str_headers = ""
-        check = True
-
-        while check:
-            raw_data = os.read(self.pipes[name]["r"], 1)
-            check, str_headers = Server.load_headers(raw_data, str_headers)
-
-        if len(str_headers) > 0 is not None:
-            headers = Headers(str_headers)
-
-            host = headers.headers.get("Host", "")
-            pos_sep = host.find(":")
-
-            if pos_sep == -1:
-                pos_sep = len(host)
-                host += ":80"
-
-            remote_address = host[:pos_sep]
-            remote_port = int(host[pos_sep + 1:])
+                print("test fin 2")
+                s.close()
+                self.serial_write(name, b'')
+            print("test fin 3")
 
             try:
-                client_socket = socket.create_connection((remote_address, remote_port))
-            except (socket.gaierror, OSError):
-                if headers is not None and headers.request_line.startswith('CONNECT'):
-                    headers = self.create_headers(502, 'Bad Gateway')
+                del(self.pipes[name])
+                os.close(fd_r)
+                os.close(fd_w)
+            except KeyError:
+                pass
+
+            Server.id -= 1
+            self.threads_stopped.append(current_thread())
+            print("Process n°{}: stopped".format(process_id))
+        except (KeyboardInterrupt, KeyError) as e:
+            print(e)
+            self.threads_stopped.append(current_thread())
+
+    def process_recv(self, client):
+        try:
+            Server.id += 1
+            process_id = Server.id
+
+            name = str(uuid3(uuid1(), "{}:{}".format(client, process_id)))
+
+            fd_r, fd_w = os.pipe()
+            self.pipes[name] = {'r': fd_r, 'w': fd_w}
+
+            print("Process n°{}: started".format(process_id))
+            if self.req_1(client):
+                print("Process n°{}:".format(process_id), "Request Accepted")
+
+                try:
+                    conns = [client, fd_r]
+                    close_connection = False
+
+                    while not close_connection:
+                        rlist, wlist, xlist = select.select(conns, [], conns)
+                        if xlist or not rlist:
+                            close_connection = True
+                        else:
+                            for r in rlist:
+                                if r == client:
+                                    data = r.recv(Server.buffer_size)
+                                    self.serial_write(name, data)
+
+                                else:
+                                    data = os.read(fd_r, Server.buffer_size)
+                                    client.sendall(data)
+
+                                if not data:
+                                    close_connection = True
+
+                except OSError as e:
+                    print("{}Process n°{}: {}{}".format(BColors.FAIL, process_id, e, BColors.ENDC))
+
+            client.close()
+            self.serial_write(name, b'')
+
+            try:
+                del(self.pipes[name])
+                os.close(fd_r)
+                os.close(fd_w)
+            except KeyError:
+                pass
+
+            self.threads_stopped.append(current_thread())
+
+            Server.id -= 1
+            print("Process n°{}: stopped".format(process_id))
+        except (KeyboardInterrupt, KeyError):
+            self.threads_stopped.append(current_thread())
+
+    def req_1(self, client):
+        version = client.recv(1)
+        nb_auth = client.recv(1)
+        auths = client.recv(int.from_bytes(nb_auth, 'big'))
+
+        if version == b'\x05':
+            if b'\x00' in auths:
+                client.sendall(b"\x05\x00")
+                return True
+
+        client.sendall(b"\x05\xFF")
+        return False
+
+    def req_2(self, fd_r, name):
+        version = os.read(fd_r, 1)
+
+        if version != b'\x05':
+            self.serial_write(name, b'\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00')
+            return None
+
+        command_code = os.read(fd_r, 1)
+
+        if not (0 < int.from_bytes(command_code, 'big') < 4):
+            self.serial_write(name, b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
+            return None
+
+        reserved = os.read(fd_r, 1)
+
+        if reserved != b'\x00':
+            self.serial_write(name, b'\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00')
+            return None
+
+        address_type = os.read(fd_r, 1)
+
+        if address_type == b'\x01':
+            address = os.read(fd_r, 4)
+            destination_address = ''
+
+            for i in range(len(address)):
+                if i > 0:
+                    destination_address += '.'
+
+                destination_address += str(address[i])
+
+        elif address_type == b'\x02':
+            destination_address_length = int.from_bytes(os.read(fd_r, 1), 'big')
+            destination_address = str(os.read(fd_r, destination_address_length))
+
+        elif address_type == b'\x03':
+            address = os.read(fd_r, 16)
+            destination_address = ''
+
+            for i in range(0, len(address), 2):
+                if i > 0:
+                    destination_address += ':'
+
+                destination_address += str(int.from_bytes(address[i:i + 1], 'big'))
+
+        else:
+            self.serial_write(name, b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
+            return None
+
+        port = int.from_bytes(os.read(fd_r, 2), 'big')
+
+        address = (destination_address, port)
+
+        try:
+            if command_code == b'\x01':
+                if address_type == b'\x01' or address_type == b'\x02':
+                    s = socket.socket()
+
                 else:
-                    headers = self.create_headers(404, 'Not Found')
+                    s = socket.socket(socket.AF_INET6)
 
-                print("{}{}{}".format(BColors.FAIL, headers.request_line, BColors.ENDC))
+                s.connect(address)
+            elif command_code == b'\x02':
+                if address_type == b'\x01' or address_type == b'\x02':
+                    s = socket.socket()
 
-                pipe = self.pipes[name]
-                del (self.pipes[name])
-                os.close(pipe["r"])
-                os.close(pipe["w"])
+                else:
+                    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
 
-                self.serial_write(name, headers.request_line.encode() + b"\r\n\r\n")
+                s.bind(address)
+            else:
+                if address_type == b'\x01' or address_type == b'\x02':
+                    s = socket.socket(type=socket.SOCK_DGRAM)
 
-                return None, None
+                else:
+                    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
 
-            return headers, client_socket
+        except socket.error:
+            self.serial_write(name, b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            return None
 
-        headers = self.create_headers(404, 'Not Found')
-        print("{}{}{}".format(BColors.FAIL, headers.request_line, BColors.ENDC))
-
-        pipe = self.pipes[name]
-        del (self.pipes[name])
-        os.close(pipe["r"])
-        os.close(pipe["w"])
-
-        self.serial_write(name, headers.request_line.encode() + b"\r\n\r\n")
-
-        return None, None
-
-    def headers_recv(self, client_socket):
-        str_headers = ""
-        check = True
-
-        while check:
-            raw_data = client_socket.recv(1)
-            check, str_headers = Server.load_headers(raw_data, str_headers)
-
-        if len(str_headers) > 0 is not None:
-            headers = Headers(str_headers)
-            name = str(uuid3(uuid1(), "{}{}".format(headers.request_line, client_socket)))
-
-            r, w = os.pipe()
-            self.pipes[name] = {'r': r, 'w': w}
-
-            return headers, name
-
-        headers = self.create_headers(404, 'Not Found')
-        print("{}{}{}".format(BColors.FAIL, headers.request_line, BColors.ENDC))
-
-        client_socket.send(headers.request_line.encode() + b"\r\n\r\n")
-
-        return None, None
+        self.serial_write(name, b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+        return command_code, s, address
