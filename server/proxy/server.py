@@ -165,10 +165,8 @@ class Server:
                         rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
 
                         if xlist or not rlist:
-                            print("test fin 1 1")
                             close_connection = True
                         else:
-                            print("test continue")
                             for r in rlist:
                                 if r == fd_r:
                                     data = os.read(fd_r, Server.buffer_size)
@@ -178,7 +176,6 @@ class Server:
                                     self.serial_write(name, data)
 
                                 if not data:
-                                    print("test fin 1 2")
                                     close_connection = True
 
                 elif command_code == b'\x02':
@@ -200,10 +197,8 @@ class Server:
                             if not data:
                                 close_connection = True
 
-                print("test fin 2")
                 s.close()
                 self.serial_write(name, b'')
-            print("test fin 3")
 
             try:
                 del(self.pipes[name])
