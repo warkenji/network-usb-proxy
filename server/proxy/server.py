@@ -1,31 +1,27 @@
 import socket
 import serial
-import time
 import os
 import select
+from ipaddress import IPv4Address, IPv6Address
 
-from .bcolors import BColors
-from .request import Headers
-from threading import Thread, current_thread, Lock
+from threading import Thread, current_thread, Lock, main_thread
 from uuid import uuid1, uuid3
 
 
 class Server:
     id = 0
+    max_requests = None
     address = None
     threads_stopped = None
     threads_started = None
     port = None
-    timeout = None
     server_serial = None
     read_lock = None
     write_lock = None
     daemon_threads = True
-    buffer_size = 8192
-    protocol = "HTTP/1.1"
-    server_version = "BaseHTTP/0.1"
+    buffer_size = 8192  # Always superior to basic SOCKS5 request (515 bytes)
     pipes = None
-    pipe_type = None
+    external = None
 
     def __init__(self, serial_port):
         self.server_serial = serial.Serial(serial_port, 9600)
@@ -35,24 +31,26 @@ class Server:
         self.read_lock = Lock()
         self.write_lock = Lock()
 
-    def start_send(self):
-        self.pipe_type = "send"
+    def start_external(self):
+        self.external = True
 
         try:
-            self.process_send_broadcast()
+            self.global_process()
         except KeyboardInterrupt:
             self.server_serial.close()
 
             for thread in self.threads_started + self.threads_stopped:
                 thread.join()
 
-    def start_recv(self, address='', port=8081):
-        self.pipe_type = "recv"
+    def start_internal(self, address='', port=8081, max_requests=32):
+        self.external = False
+
         self.address = address
         self.port = port
+        self.max_requests = max_requests
 
         try:
-            self.process_recv_broadcast()
+            self.global_internal_process()
         except KeyboardInterrupt:
             self.server_serial.close()
 
@@ -62,9 +60,9 @@ class Server:
     def serial_read(self):
         self.read_lock.acquire()
         name = self.server_serial.read(36).decode()
-        size = int(self.server_serial.read_until()[:-1])
+        size = self.server_serial.read_until()
 
-        data = self.server_serial.read(size)
+        data = size + self.server_serial.read(int(size[:-1]))
 
         self.read_lock.release()
 
@@ -79,33 +77,24 @@ class Server:
 
         self.write_lock.release()
 
-    def process_broadcast(self):
+    def global_process(self):
         try:
             while True:
                 try:
                     name, data = self.serial_read()
-                    if name not in self.pipes and self.pipe_type == "send" and len(data) > 0:
+                    size = int(data.split(b'\n', 1)[0])
+
+                    if name not in self.pipes and self.external and size:
                         r, w = os.pipe()
 
                         self.pipes[name] = {"r": r, "w": w}
 
-                        thread = Thread(target=self.process_send, args=(name,), daemon=Server.daemon_threads)
+                        thread = Thread(target=self.local_external_request, args=(name,), daemon=Server.daemon_threads)
                         thread.start()
                         self.threads_started.append(thread)
 
-                    print(name, len(data))
                     if name in self.pipes:
-                        pipe = self.pipes[name]
-                        if len(data) > 0:
-                            os.write(pipe["w"], data)
-                        else:
-                            try:
-                                del (self.pipes[name])
-                                os.close(pipe['r'])
-                                os.close(pipe['w'])
-                                print("closed")
-                            except KeyError:
-                                pass
+                        os.write(self.pipes[name]["w"], data)
 
                 except OSError as e:
                     print(e)
@@ -118,24 +107,20 @@ class Server:
         except KeyboardInterrupt:
             pass
 
-    def process_send_broadcast(self):
-        self.process_broadcast()
-
-    def process_recv_broadcast(self):
-        max_users = 32
+    def global_internal_process(self):
         server_socket = socket.socket()
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((self.address, self.port))
-        server_socket.listen(max_users)
+        server_socket.listen(self.max_requests)
 
-        thread = Thread(target=self.process_broadcast, daemon=Server.daemon_threads)
+        thread = Thread(target=self.global_process, daemon=Server.daemon_threads)
         thread.start()
 
         self.threads_started.append(thread)
 
         while True:
             (client_socket, client_address) = server_socket.accept()
-            thread = Thread(target=self.process_recv, args=(client_socket,), daemon=Server.daemon_threads)
+            thread = Thread(target=self.local_internal_process, args=(client_socket,), daemon=Server.daemon_threads)
             thread.start()
             self.threads_started.append(thread)
 
@@ -144,61 +129,71 @@ class Server:
 
             self.threads_stopped.clear()
 
-    def process_send(self, name):
+    def local_external_request(self, name):
         try:
             Server.id += 1
             process_id = Server.id
-            print("Process n°{}: started".format(process_id))
+            print("Process n°{}: Connected".format(process_id))
 
             pipe = self.pipes[name]
             fd_r = pipe["r"]
             fd_w = pipe["w"]
-            result = self.req_2(fd_r, name)
+            result = self.external_request(fd_r, name)
 
             if result:
+                print("Process n°{}: Request Accepted".format(process_id))
+
                 command_code, s, address = result
+
                 if command_code == b'\x01':
                     conns = [fd_r, s]
                     close_connection = False
 
                     while not close_connection:
-                        rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
+                        rlist, wlist, xlist = select.select(conns, [], conns)
 
                         if xlist or not rlist:
                             close_connection = True
+                            self.serial_write(name, b'')
                         else:
                             for r in rlist:
                                 if r == fd_r:
-                                    data = os.read(fd_r, Server.buffer_size)
+                                    raw_data = os.read(fd_r, Server.buffer_size + len(str(Server.buffer_size)) + 1)
+                                    size, data = raw_data.split(b'\n', 1)
                                     s.sendall(data)
+
+                                    if not int(size):
+                                        close_connection = True
+
                                 else:
                                     data = r.recv(Server.buffer_size)
                                     self.serial_write(name, data)
 
-                                if not data:
-                                    close_connection = True
-
-                elif command_code == b'\x02':
-                    pass
+                                    if not data:
+                                        close_connection = True
+                                        self.serial_write(name, b'')
 
                 elif command_code == b'\x03':
                     conns = [fd_r]
                     close_connection = False
 
                     while not close_connection:
-                        rlist, wlist, xlist = select.select(conns, [], conns, Server.timeout)
+                        rlist, wlist, xlist = select.select(conns, [], conns)
 
                         if xlist or not rlist:
                             close_connection = True
                         else:
-                            data = os.read(fd_r, Server.buffer_size)
+                            raw_data = os.read(fd_r, Server.buffer_size + len(str(Server.buffer_size)) + 1)
+                            size, data = raw_data.split(b'\n', 1)
                             s.sendto(data, address)
 
-                            if not data:
+                            if not int(size):
                                 close_connection = True
 
                 s.close()
-                self.serial_write(name, b'')
+
+            else:
+                print("Process n°{}: Request Refused".format(process_id))
 
             try:
                 del(self.pipes[name])
@@ -209,12 +204,12 @@ class Server:
 
             Server.id -= 1
             self.threads_stopped.append(current_thread())
-            print("Process n°{}: stopped".format(process_id))
+            print("Process n°{}: Disconnected".format(process_id))
         except (KeyboardInterrupt, KeyError) as e:
             print(e)
             self.threads_stopped.append(current_thread())
 
-    def process_recv(self, client):
+    def local_internal_process(self, client):
         try:
             Server.id += 1
             process_id = Server.id
@@ -224,36 +219,40 @@ class Server:
             fd_r, fd_w = os.pipe()
             self.pipes[name] = {'r': fd_r, 'w': fd_w}
 
-            print("Process n°{}: started".format(process_id))
-            if self.req_1(client):
-                print("Process n°{}:".format(process_id), "Request Accepted")
+            print("Process n°{}: Connected".format(process_id))
+            if self.internal_request(client):
+                print("Process n°{}: Authenticated".format(process_id))
 
-                try:
-                    conns = [client, fd_r]
-                    close_connection = False
+                conns = [client, fd_r]
+                close_connection = False
 
-                    while not close_connection:
-                        rlist, wlist, xlist = select.select(conns, [], conns)
-                        if xlist or not rlist:
-                            close_connection = True
-                        else:
-                            for r in rlist:
-                                if r == client:
-                                    data = r.recv(Server.buffer_size)
-                                    self.serial_write(name, data)
-
-                                else:
-                                    data = os.read(fd_r, Server.buffer_size)
-                                    client.sendall(data)
+                while not close_connection:
+                    rlist, wlist, xlist = select.select(conns, [], conns)
+                    if xlist or not rlist:
+                        close_connection = True
+                        self.serial_write(name, b'')
+                    else:
+                        for r in rlist:
+                            if r == client:
+                                data = r.recv(Server.buffer_size)
+                                self.serial_write(name, data)
 
                                 if not data:
                                     close_connection = True
+                                    self.serial_write(name, b'')
 
-                except OSError as e:
-                    print("{}Process n°{}: {}{}".format(BColors.FAIL, process_id, e, BColors.ENDC))
+                            else:
+                                raw_data = os.read(fd_r, Server.buffer_size + len(str(Server.buffer_size)) + 1)
+                                size, data = raw_data.split(b'\n', 1)
+                                client.sendall(data)
+
+                                if not int(size):
+                                    close_connection = True
+
+            else:
+                print("Process n°{}: Authentication not allowed".format(process_id))
 
             client.close()
-            self.serial_write(name, b'')
 
             try:
                 del(self.pipes[name])
@@ -265,11 +264,11 @@ class Server:
             self.threads_stopped.append(current_thread())
 
             Server.id -= 1
-            print("Process n°{}: stopped".format(process_id))
+            print("Process n°{}: Disconnected".format(process_id))
         except (KeyboardInterrupt, KeyError):
             self.threads_stopped.append(current_thread())
 
-    def req_1(self, client):
+    def internal_request(self, client):
         version = client.recv(1)
         nb_auth = client.recv(1)
         auths = client.recv(int.from_bytes(nb_auth, 'big'))
@@ -282,7 +281,13 @@ class Server:
         client.sendall(b"\x05\xFF")
         return False
 
-    def req_2(self, fd_r, name):
+    # TODO send connection information to serial port
+    def external_request(self, fd_r, name):
+        current_byte = b''
+
+        while current_byte != b'\n':
+            current_byte = os.read(fd_r, 1)
+
         version = os.read(fd_r, 1)
 
         if version != b'\x05':
@@ -291,7 +296,7 @@ class Server:
 
         command_code = os.read(fd_r, 1)
 
-        if not (0 < int.from_bytes(command_code, 'big') < 4):
+        if command_code != b'\x01' and command_code != b'\x03':
             self.serial_write(name, b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
             return None
 
@@ -304,28 +309,14 @@ class Server:
         address_type = os.read(fd_r, 1)
 
         if address_type == b'\x01':
-            address = os.read(fd_r, 4)
-            destination_address = ''
-
-            for i in range(len(address)):
-                if i > 0:
-                    destination_address += '.'
-
-                destination_address += str(address[i])
-
-        elif address_type == b'\x02':
-            destination_address_length = int.from_bytes(os.read(fd_r, 1), 'big')
-            destination_address = str(os.read(fd_r, destination_address_length))
+            destination_address = str(IPv4Address(os.read(fd_r, 4)))
 
         elif address_type == b'\x03':
-            address = os.read(fd_r, 16)
-            destination_address = ''
+            destination_address_length = int.from_bytes(os.read(fd_r, 1), 'big')
+            destination_address = os.read(fd_r, destination_address_length).decode()
 
-            for i in range(0, len(address), 2):
-                if i > 0:
-                    destination_address += ':'
-
-                destination_address += str(int.from_bytes(address[i:i + 1], 'big'))
+        elif address_type == b'\x04':
+            destination_address = str(IPv6Address(os.read(fd_r, 16)))
 
         else:
             self.serial_write(name, b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
@@ -337,23 +328,15 @@ class Server:
 
         try:
             if command_code == b'\x01':
-                if address_type == b'\x01' or address_type == b'\x02':
+                if address_type == b'\x01' or address_type == b'\x03':
                     s = socket.socket()
 
                 else:
                     s = socket.socket(socket.AF_INET6)
 
                 s.connect(address)
-            elif command_code == b'\x02':
-                if address_type == b'\x01' or address_type == b'\x02':
-                    s = socket.socket()
-
-                else:
-                    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-
-                s.bind(address)
             else:
-                if address_type == b'\x01' or address_type == b'\x02':
+                if address_type == b'\x01' or address_type == b'\x03':
                     s = socket.socket(type=socket.SOCK_DGRAM)
 
                 else:
