@@ -158,16 +158,23 @@ class Server:
                         else:
                             for r in rlist:
                                 if r == fd_r:
-                                    raw_data = os.read(fd_r, Server.buffer_size + len(str(Server.buffer_size)) + 1)
-                                    size, data = raw_data.split(b'\n', 1)
-                                    s.sendall(data)
+
+                                    try:
+                                        raw_data = os.read(fd_r, Server.buffer_size + len(str(Server.buffer_size)) + 1)
+                                        size, data = raw_data.split(b'\n', 1)
+                                        s.sendall(data)
+                                    except ConnectionResetError:
+                                        size = b'0'
 
                                     if not int(size):
                                         close_connection = True
 
                                 else:
-                                    data = r.recv(Server.buffer_size)
-                                    self.serial_write(name, data)
+                                    try:
+                                        data = r.recv(Server.buffer_size)
+                                        self.serial_write(name, data)
+                                    except ConnectionResetError:
+                                        data = None
 
                                     if not data:
                                         close_connection = True
@@ -234,17 +241,23 @@ class Server:
                     else:
                         for r in rlist:
                             if r == client:
-                                data = r.recv(Server.buffer_size)
-                                self.serial_write(name, data)
+                                try:
+                                    data = r.recv(Server.buffer_size)
+                                    self.serial_write(name, data)
+                                except ConnectionResetError:
+                                    data = None
 
                                 if not data:
                                     close_connection = True
                                     self.serial_write(name, b'')
 
                             else:
-                                raw_data = os.read(fd_r, Server.buffer_size + len(str(Server.buffer_size)) + 1)
-                                size, data = raw_data.split(b'\n', 1)
-                                client.sendall(data)
+                                try:
+                                    raw_data = os.read(fd_r, Server.buffer_size + len(str(Server.buffer_size)) + 1)
+                                    size, data = raw_data.split(b'\n', 1)
+                                    client.sendall(data)
+                                except ConnectionResetError:
+                                    size = b'0'
 
                                 if not int(size):
                                     close_connection = True
